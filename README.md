@@ -44,9 +44,16 @@ Note: Requires a machine with at least 1 GPU.
 python predict_proteome.py --fasta my_proteome.fasta --output predictions.csv
 ```
 
+Embeddings are automatically computed in batches, stored in an optimized HDF5 file (`my_proteome.flashppi.h5` in float16), and loaded on-demand. This guarantees constant, low VRAM usage regardless of proteome scale, and makes future runs instantaneous:
+
+```bash
+# Re-run with a different threshold without recomputing embeddings:
+python predict_proteome.py --embeddings my_proteome.flashppi.h5 --threshold 0.7 --output high_conf.csv
+```
+
 ### Cross-Proteome PPI Screening (Host–Viral)
 
-Predict interactions between two proteomes, for example a viral genome and its host genome.
+Predict interactions between two proteomes, for example a viral genome and its host genome:
 
 ```bash
 python predict_cross_proteome.py \
@@ -54,6 +61,24 @@ python predict_cross_proteome.py \
     --viral_fasta virus.fasta \
     --output predictions.csv
 ```
+
+Host embeddings can be computed once and reused across dozens of viral screens:
+
+```bash
+python predict_cross_proteome.py \
+    --host_embeddings host.flashppi.h5 \
+    --viral_fasta virus.fasta \
+    --output predictions.csv
+```
+
+### Standalone Embedding Computation
+
+You can also precompute and cache embeddings separately:
+
+```bash
+python embed_proteome.py --fasta proteome.fasta --output proteome.flashppi.h5
+```
+
 
 ### Visualizing contact predictions
 

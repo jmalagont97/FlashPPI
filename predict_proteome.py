@@ -1,111 +1,196 @@
+#!/usr/bin/env python3
+"""
+FlashPPI: Fast Proteome-wide PPI Screening (Staged with HDF5 caching)
+
+Predicts protein-protein interactions within a single proteome.
+Computes and caches embeddings into HDF5 (fp16), maintaining minimal and constant VRAM usage.
+
+Usage:
+  python predict_proteome.py --fasta my_proteome.fasta --output predictions.csv
+"""
 import argparse
-import torch
-import faiss
+import os
 import numpy as np
 import pandas as pd
-from Bio import SeqIO
-from tqdm import tqdm
-from transformers import AutoModel, AutoTokenizer
-from torch.nn.utils.rnn import pad_sequence
+import torch
+
+from flashppi.pipeline import ensure_embeddings, faiss_topk, load_model, score_pairs
+
 
 def main():
-    parser = argparse.ArgumentParser(description="FlashPPI: Fast Proteome-wide PPI Screening")
-    parser.add_argument("--fasta", type=str, required=True, help="Path to the input FASTA file containing the proteome.")
-    parser.add_argument("--output", type=str, default="predictions.csv", help="Path to save the output CSV. Default: predictions.csv")
-    parser.add_argument("--model_name", type=str, default="tattabio/flashppi", help="HuggingFace model ID or local path.")
-    parser.add_argument("--stage1_top_k", type=int, default=100, help="Number of nearest neighbors to retrieve per protein in stage 1.")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Contact score threshold to keep predictions.")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for model inference.")
-    parser.add_argument("--max_len", type=int, default=1024, help="Maximum sequence length.")
-    
+    parser = argparse.ArgumentParser(
+        description="FlashPPI: Fast Proteome-wide PPI Screening (All-vs-All with HDF5 caching)"
+    )
+    parser.add_argument(
+        "--fasta",
+        type=str,
+        default=None,
+        help="Path to the input FASTA file containing the proteome.",
+    )
+    parser.add_argument(
+        "--embeddings",
+        type=str,
+        default=None,
+        help="Path to existing or target HDF5 embedding cache file (default: <fasta_stem>.flashppi.h5).",
+    )
+    parser.add_argument(
+        "--overwrite_embeddings",
+        action="store_true",
+        help="Force recomputing and overwrite the HDF5 embedding cache.",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="predictions.csv",
+        help="Path to save the output CSV. Default: predictions.csv",
+    )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="tattabio/flashppi",
+        help="HuggingFace model ID or local path.",
+    )
+    parser.add_argument(
+        "--stage1_top_k",
+        type=int,
+        default=100,
+        help="Number of nearest neighbors to retrieve per protein in stage 1.",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.5,
+        help="Contact score threshold to keep predictions.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=64,
+        help="Batch size for protein encoding (stage 1).",
+    )
+    parser.add_argument(
+        "--contact_batch_size",
+        type=int,
+        default=None,
+        help="Batch size for contact prediction (stage 2). Default: same as --batch_size.",
+    )
+    parser.add_argument(
+        "--max_len",
+        type=int,
+        default=1024,
+        help="Maximum sequence length.",
+    )
+    parser.add_argument(
+        "--cache_gb",
+        type=float,
+        default=4.0,
+        help="RAM cache budget in GB for residue embeddings.",
+    )
+    parser.add_argument(
+        "--raw_scores",
+        type=str,
+        default=None,
+        help="Optional path to save all raw candidate pair scores as a Parquet file.",
+    )
+    parser.add_argument(
+        "--embed_only",
+        action="store_true",
+        help="Only run stage 1 (compute and cache embeddings into HDF5), then exit.",
+    )
+    parser.add_argument(
+        "--delete_embeddings",
+        action="store_true",
+        help="Delete intermediate HDF5 embedding file after completion.",
+    )
+
     args = parser.parse_args()
-    
+
+    if not args.fasta and not args.embeddings:
+        parser.error("You must specify either --fasta or --embeddings.")
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, tokenizer = load_model(args.model_name, device)
 
-    print(f"Loading model and tokenizer ({args.model_name}) to {device}...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
-    model = AutoModel.from_pretrained(args.model_name, trust_remote_code=True).to(device).eval()
+    print("Stage 1: Ensuring protein embeddings in HDF5 cache...")
+    store = ensure_embeddings(
+        fasta_path=args.fasta,
+        h5_path=args.embeddings,
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        batch_size=args.batch_size,
+        max_len=args.max_len,
+        model_name=args.model_name,
+        overwrite=args.overwrite_embeddings,
+        cache_gb=args.cache_gb,
+        desc="Stage 1: Encoding proteins",
+    )
 
-    print(f"Loading sequences from {args.fasta}...")
-    records = list(SeqIO.parse(args.fasta, "fasta"))
-    sequences = [str(r.seq) for r in records]
-    ids = [r.id for r in records]
+    if args.embed_only:
+        print(f"Embeddings saved to '{store.h5_path}'. Exiting (--embed_only).")
+        store.close()
+        return
 
-    if len(sequences) < 2:
-        raise ValueError("FASTA file must contain at least 2 sequences to predict interactions.")
+    n_proteins = len(store)
+    if n_proteins < 2:
+        store.close()
+        raise ValueError("FASTA/embedding store must contain at least 2 sequences to predict interactions.")
 
-    print("Stage 1: Encoding proteins...")
-    query_embeds, key_embeds, residue_embeds_list, seq_lengths = [], [], [], []
+    print(f"\nStage 1: FAISS Retrieval across {n_proteins} proteins...")
+    search_k = min(args.stage1_top_k + 1, n_proteins)
+    _, I = faiss_topk(store.q_embeds, store.k_embeds, search_k)
 
-    with torch.no_grad(), torch.autocast(device, dtype=torch.float16):
-        for i in tqdm(range(0, len(sequences), args.batch_size), desc="Encoding", unit="batch"):
-            batch_seqs = sequences[i : i + args.batch_size]
-            inputs = tokenizer(batch_seqs, return_tensors="pt", padding=True, truncation=True, max_length=args.max_len).to(device)
-            
-            res_embed = model.encode_protein(inputs["input_ids"], inputs["attention_mask"])
-            query_embeds.append(model.head_q(res_embed, inputs["attention_mask"]).cpu().float().numpy())
-            key_embeds.append(model.head_k(res_embed, inputs["attention_mask"]).cpu().float().numpy())
-            
-            lengths = inputs["attention_mask"].sum(dim=1).tolist()
-            for j, seq_len in enumerate(lengths):
-                residue_embeds_list.append(res_embed[j, :int(seq_len), :])
-                seq_lengths.append(int(seq_len))
-
-    query_embeds = np.concatenate(query_embeds, axis=0)
-    key_embeds = np.concatenate(key_embeds, axis=0)
-    residue_embeds = torch.cat(residue_embeds_list, dim=0)
-    
-    cu_seqlens = torch.zeros(len(seq_lengths) + 1, dtype=torch.long, device=device)
-    cu_seqlens[1:] = torch.tensor(seq_lengths, dtype=torch.long, device=device).cumsum(0)
-
-    print("FAISS Retrieval...")
-    index = faiss.IndexFlatIP(key_embeds.shape[1])
-    index.add(key_embeds)
-    
-    search_k = min(args.stage1_top_k + 1, len(sequences))
-    _, I = index.search(query_embeds, k=search_k)
-
-    inference_tasks = [(q, int(c)) for q in range(len(sequences)) for c in I[q] if c >= 0 and c != q]
+    inference_tasks = [
+        (q, int(c)) for q in range(n_proteins) for c in I[q] if c >= 0 and c != q
+    ]
     print(f"Found {len(inference_tasks)} candidate pairs. Starting fine-grained contact prediction...")
 
+    contact_bs = args.contact_batch_size if args.contact_batch_size is not None else args.batch_size
+    scores = score_pairs(
+        model=model,
+        q_store=store,
+        c_store=store,
+        tasks=inference_tasks,
+        contact_batch_size=contact_bs,
+        device=device,
+        desc="Contact prediction",
+        raw_scores_path=args.raw_scores,
+    )
+
     results = []
-    with torch.no_grad(), torch.autocast(device, dtype=torch.float16):
-        for i in tqdm(range(0, len(inference_tasks), args.batch_size), desc="Contact prediction", unit="batch"):
-            batch = inference_tasks[i : i + args.batch_size]
-            q_batch = [residue_embeds[cu_seqlens[q]:cu_seqlens[q+1]] for q, _ in batch]
-            c_batch = [residue_embeds[cu_seqlens[c]:cu_seqlens[c+1]] for _, c in batch]
-            
-            pad_q = pad_sequence(q_batch, batch_first=True)
-            pad_c = pad_sequence(c_batch, batch_first=True)
-            mask_q = (pad_q.abs().sum(dim=-1) != 0).long()
-            mask_c = (pad_c.abs().sum(dim=-1) != 0).long()
-            
-            logits, valid_mask = model.predict_contacts(pad_q, pad_c, mask_q, mask_c)
-            # exclude padded cells from the max, as FlashPPIModel.forward does
-            logits = logits.float().masked_fill(~valid_mask, float("-inf"))
-            scores = torch.sigmoid(logits.flatten(1).max(dim=-1).values).cpu().numpy()
-            
-            for k, (q_idx, c_idx) in enumerate(batch):
-                if scores[k] > args.threshold:
-                    results.append({
-                        "query_id": ids[q_idx], 
-                        "match_id": ids[c_idx], 
-                        "contact_score": float(scores[k])
-                    })
+    for k, (q_idx, c_idx) in enumerate(inference_tasks):
+        if scores[k] > args.threshold:
+            results.append({
+                "query_id": store.ids[q_idx],
+                "match_id": store.ids[c_idx],
+                "contact_score": float(scores[k]),
+            })
 
     # Deduplicate and save
     df = pd.DataFrame(results)
     if not df.empty:
-        # Sort so pair keys are consistent for deduplication
-        df['pair_key'] = df.apply(lambda r: tuple(sorted([r['query_id'], r['match_id']])), axis=1)
+        # Vectorized pair key calculation for high performance
+        q_arr = df["query_id"].values
+        m_arr = df["match_id"].values
+        cond = q_arr < m_arr
+        df["pair_key"] = list(zip(np.where(cond, q_arr, m_arr), np.where(cond, m_arr, q_arr)))
+
         # Keep the maximum score for each unique pair
-        df = df.loc[df.groupby('pair_key')['contact_score'].idxmax()].drop(columns=['pair_key'])
-        df = df.sort_values(by='contact_score', ascending=False)
-        
+        df = df.loc[df.groupby("pair_key")["contact_score"].idxmax()].drop(columns=["pair_key"])
+        df = df.sort_values(by="contact_score", ascending=False)
+
         df.to_csv(args.output, index=False)
-        print(f"Success! Saved {len(df)} high-confidence predictions to {args.output}")
+        print(f"\nSuccess! Saved {len(df)} high-confidence predictions to {args.output}")
     else:
-        print(f"No interactions found above the threshold of {args.threshold}.")
+        print(f"\nNo interactions found above the threshold of {args.threshold}.")
+
+    h5_file_to_delete = store.h5_path if args.delete_embeddings else None
+    store.close()
+
+    if h5_file_to_delete and os.path.exists(h5_file_to_delete):
+        os.remove(h5_file_to_delete)
+        print(f"Cleaned up intermediate embeddings: {h5_file_to_delete}")
+
 
 if __name__ == "__main__":
     main()

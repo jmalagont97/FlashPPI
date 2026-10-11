@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# FlashPPI embeddings & intermediate artifacts
+*.flashppi.h5
+*.parquet
+predictions.csv
+cross_predictions.csv
